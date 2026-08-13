@@ -4,9 +4,15 @@ import io
 import traceback
 from typing import TypedDict, List, Optional
 
+import uvicorn
+from fastapi import FastAPI
+from pydantic import BaseModel
+
 from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.tools import tool
 from langgraph.graph import StateGraph, START, END
+from langgraph.types import interrupt, Command
+from langgraph.checkpoint.memory import MemorySaver
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 # ==========================================
@@ -70,12 +76,11 @@ def generate_test_cases(task_description: str) -> str:
 
 
 # ==========================================
-# 4. GRAPH NODES
+# 4. GRAPH NODES (input() replaced with interrupt())
 # ==========================================
 def task_input_node(state: CrewState):
-    print("\n" + "=" * 50)
-    print("--- NEW TASK INITIALIZATION ---")
-    user_task = input("Enter the coding task (or type 'exit' to quit): ").strip()
+    user_task = interrupt({"prompt": "Enter the coding task (or type 'exit' to quit):"})
+    user_task = str(user_task).strip()
 
     if user_task.lower() == "exit":
         return {"next_step": "exit"}
@@ -87,7 +92,6 @@ def task_input_node(state: CrewState):
 
 
 def real_time_developer(state: CrewState):
-    print("\n[Developer] Writing dynamic code using LLM...")
     task = state["messages"][-1].content
     dev_prompt = (
         f"Write a clean Python script to solve this: {task}. "
@@ -102,12 +106,10 @@ def real_time_developer(state: CrewState):
     else:
         code_str = str(content)
 
-    print(code_str)
     return {"code": code_str}
 
 
 def real_time_tester(state: CrewState):
-    print("\n[Tester] Generating dynamic tests and executing code...")
     task = state["messages"][-1].content
 
     test_cases = generate_test_cases.invoke(task)
@@ -124,12 +126,12 @@ def real_time_tester(state: CrewState):
 
 
 def manager_decision_node(state: CrewState):
-    print("\n" + "=" * 50)
-    print("--- MANAGER DASHBOARD : TEST REPORT ---")
-    print(state.get("report", "No report available."))
-    print("=" * 50)
-
-    user_input = input("\nCommand (store / another): ").lower().strip()
+    user_input = interrupt({
+        "prompt": "Command (store / another):",
+        "code": state.get("code"),
+        "report": state.get("report"),
+    })
+    user_input = str(user_input).strip().lower()
 
     if user_input == "store":
         return {"next_step": "archiver"}
@@ -138,7 +140,6 @@ def manager_decision_node(state: CrewState):
 
 
 def archiver_node(state: CrewState):
-    print("\n[Archiver] Task stored successfully. Closing workflow.")
     return {"next_step": "exit"}
 
 
@@ -177,17 +178,62 @@ def route_from_decision(state):
 rt_workflow.add_conditional_edges("manager_decision", route_from_decision)
 rt_workflow.add_edge("archiver", END)
 
-rt_app = rt_workflow.compile()
-print("Interactive pipeline compiled and ready for live execution.")
+checkpointer = MemorySaver()
+rt_app = rt_workflow.compile(checkpointer=checkpointer)
 
 
 # ==========================================
-# 6. EXECUTION LOOP
+# 6. FASTAPI APP
 # ==========================================
+app = FastAPI(
+    title="Dev/Test/Manager Crew Pipeline",
+    version="1.0",
+    description="LangGraph dev-test-manager pipeline driven over HTTP instead of terminal input().",
+)
+
+
+class StartRequest(BaseModel):
+    thread_id: str = "default"
+
+
+class ResumeRequest(BaseModel):
+    thread_id: str = "default"
+    value: str
+
+
+def format_result(result: dict) -> dict:
+    if "__interrupt__" in result:
+        payload = result["__interrupt__"][0].value
+        return {"status": "waiting_for_input", **payload}
+    return {
+        "status": "finished",
+        "code": result.get("code"),
+        "report": result.get("report"),
+    }
+
+
+@app.get("/")
+def root():
+    return {"message": "Server running. POST /task/start then /task/resume to drive the pipeline."}
+
+
+@app.post("/task/start")
+def start_task(req: StartRequest):
+    config = {"configurable": {"thread_id": req.thread_id}}
+    result = rt_app.invoke(
+        {"messages": [], "next_step": None, "code": None, "report": None},
+        config=config,
+    )
+    return format_result(result)
+
+
+@app.post("/task/resume")
+def resume_task(req: ResumeRequest):
+    config = {"configurable": {"thread_id": req.thread_id}}
+    result = rt_app.invoke(Command(resume=req.value), config=config)
+    return format_result(result)
+
+
 if __name__ == "__main__":
-    try:
-        rt_app.invoke({"messages": []}, config={"recursion_limit": 50})
-    except KeyboardInterrupt:
-        print("\nStopped by user.")
-    except Exception as e:
-        print(f"\nAn error occurred: {e}")
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
